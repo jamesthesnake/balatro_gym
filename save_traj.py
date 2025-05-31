@@ -21,7 +21,7 @@ from heuristic_baseline import (
 # ──────────────────────────────────────────────────────────────────────── #
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────── #
-NUM_ROUNDS = 500_000             # how many rounds (each round = up to 4 hands) to collect
+NUM_ROUNDS = 500             # how many rounds (each round = up to 4 hands) to collect
 HANDS_PER_ROUND = 4              # define a round as exactly 4 hands
 DISCARDS_PER_ROUND = 4           # total discard budget across HANDS_PER_ROUND hands
 PASS_THRESHOLD = 300             # raw‐chip score threshold for pass/fail at the end of a round
