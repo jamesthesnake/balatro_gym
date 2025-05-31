@@ -1,12 +1,14 @@
 import numpy as np
+from itertools import combinations
 from balatro_gym.env import EightCardDrawEnv
 from balatro_gym.actions import encode_select
+from balatro_gym.balatro_game import Card, BalatroGame
 from typing import List, Tuple
 
 # ------------------------------------------------------------------
 # Heuristic parameters
 # ------------------------------------------------------------------
-# We’ll discard cards whose “rank index” is below this threshold.
+# We'll discard cards whose "rank index" is below this threshold.
 # Card indices run 0..51, with rank = idx % 13 (0 → 2, 1 → 3, …, 8 → T, 9 → J, 10 → Q, 11 → K, 12 → A).
 # If threshold_rank = 8, then anything with rank < 8 (i.e. 2..9) gets discarded;  T, J, Q, K, A are kept.
 THRESHOLD_RANK = 8
@@ -31,6 +33,19 @@ def rank_of_card(card_idx: int) -> int:
     return card_idx % 13
 
 
+def card_idx_to_card_object(card_idx: int) -> Card:
+    """
+    Convert a card index (0-51) to a Card object.
+    """
+    rank_idx = card_idx % 13
+    suit_idx = card_idx // 13
+    
+    rank = list(Card.Ranks)[rank_idx]
+    suit = list(Card.Suits)[suit_idx]
+    
+    return Card(rank, suit)
+
+
 def make_discard_action(hand: np.ndarray, threshold_rank: int) -> int:
     """
     Given `hand`, a length‐8 np.ndarray of card indices (0..51),
@@ -46,17 +61,44 @@ def make_discard_action(hand: np.ndarray, threshold_rank: int) -> int:
     return mask  # this is an integer in [0..255]
 
 
+def evaluate_all_combinations(hand: np.ndarray) -> Tuple[int, int]:
+    """
+    Given `hand`, a length‐8 np.ndarray of card indices,
+    evaluate all possible 5-card combinations (C(8,5) = 56) 
+    and return the best score along with the positions of the best hand.
+    
+    Returns:
+        Tuple of (best_score, best_positions_tuple)
+    """
+    best_score = -1
+    best_positions = None
+    
+    # Generate all possible 5-card combinations from 8 cards
+    for positions in combinations(range(8), 5):
+        # Convert card indices to Card objects
+        card_indices = [hand[pos] for pos in positions]
+        card_objects = [card_idx_to_card_object(idx) for idx in card_indices]
+        
+        # Evaluate this 5-card hand using BalatroGame's evaluation function
+        score = BalatroGame._evaluate_hand(card_objects)
+        
+        if score > best_score:
+            best_score = score
+            best_positions = positions
+    
+    return best_score, best_positions
+
+
 def make_select_action(hand: np.ndarray) -> int:
     """
     Given `hand`, a length‐8 np.ndarray of card indices after drawing new cards,
-    select the 5 highest-ranked cards and return the appropriate action ID [256..311].
-    We break ties by taking lower index first if ranks are equal.
+    evaluate all 56 possible 5-card combinations and select the best one.
+    Returns the appropriate action ID [256..311].
     """
-    ranks = hand % 13  # array of 8 rank‐indices
-    # Sort positions 0..7 by rank descending, tie‐break on card index ascending
-    sorted_positions = sorted(range(8), key=lambda i: (ranks[i], hand[i]), reverse=True)
-    # Take the top 5 positions
-    keep_positions: Tuple[int, ...] = tuple(sorted(sorted_positions[:5]))
+    best_score, best_positions = evaluate_all_combinations(hand)
+    
+    # Sort the positions for consistent encoding
+    keep_positions: Tuple[int, ...] = tuple(sorted(best_positions))
     return encode_select(keep_positions)  # map that 5‐tuple to [256..311]
 
 
@@ -64,7 +106,8 @@ def run_one_episode(threshold_rank: int) -> float:
     """
     Run a single hand of EightCardDrawEnv using the two‐phase heuristic:
      1) Discard all cards whose rank < threshold_rank.
-     2) From the resulting 8 cards, keep the 5 highest‐ranked cards to score.
+     2) From the resulting 8 cards, evaluate all 56 possible 5-card hands 
+        and keep the one with the highest score.
     Returns the episode reward (hand score ∈ [0,1]).
     """
     env = EightCardDrawEnv()
@@ -76,7 +119,7 @@ def run_one_episode(threshold_rank: int) -> float:
     discard_action = make_discard_action(hand, threshold_rank)
     # Step through discard. This draws replacement cards automatically.
     obs2, reward0, terminated0, truncated0, info0 = env.step(discard_action)
-    # terminated0 should be False, because we haven’t scored yet (phase → 1)
+    # terminated0 should be False, because we haven't scored yet (phase → 1)
     assert not terminated0
 
     # ----------------------- Phase 1: Select‐Five -----------------------
@@ -93,9 +136,13 @@ def run_one_episode(threshold_rank: int) -> float:
 def main():
     # Run many episodes and record the rewards
     rewards = []
-    for _ in range(NUM_EPISODES):
+    for i in range(NUM_EPISODES):
         r = run_one_episode(THRESHOLD_RANK)
         rewards.append(r)
+        
+        # Print progress every 100 episodes
+        if (i + 1) % 100 == 0:
+            print(f"Completed {i + 1}/{NUM_EPISODES} episodes...")
 
     rewards = np.array(rewards, dtype=np.float32)
     avg_reward = float(np.mean(rewards))
@@ -103,11 +150,11 @@ def main():
     max_reward = float(np.max(rewards))
     min_reward = float(np.min(rewards))
 
-    print(f"Ran {NUM_EPISODES} episodes with THRESHOLD_RANK = {THRESHOLD_RANK}")
+    print(f"\nRan {NUM_EPISODES} episodes with THRESHOLD_RANK = {THRESHOLD_RANK}")
+    print(f"Using exhaustive evaluation of all 56 possible 5-card combinations")
     print(f"Average hand score: {avg_reward:.4f}  ± {std_reward:.4f}")
     print(f"Min hand score: {min_reward:.4f}   Max hand score: {max_reward:.4f}")
 
 
 if __name__ == "__main__":
     main()
-
