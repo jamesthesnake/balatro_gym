@@ -1,0 +1,8 @@
+torch==2.2.2
+transformers==4.40.1
+trlx==0.6.0         # includes accelerate & deepspeed
+bitsandbytes==0.43.0
+unsloth==0.6.1
+pufferlib==0.5.0
+gymnasium==0.29.1
+balatro-gym @ git+https://github.com/cassiusfive/balatro-gym.git

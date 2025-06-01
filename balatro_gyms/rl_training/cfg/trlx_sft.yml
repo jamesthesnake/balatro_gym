@@ -1,0 +1,27 @@
+# rl_training/cfg/trlx_sft.yml
+model:
+  model_path: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  load_in_4bit: true
+  lora_rank: 64
+  lora_alpha: 16           # unsloth default
+
+tokenizer:
+  tokenizer_path: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  add_special_tokens: ["<SEP>", "<EOS>"]
+
+train:
+  epochs: 2
+  batch_size: 512          # global
+  seq_length: 256
+  gradient_accumulation_steps: 16
+  lr: 2e-4
+  seed: 42
+  checkpoint_interval: 1000
+
+deepspeed:
+  zero_optimization:
+    stage: 2
+
+method:
+  name: SFT
+
