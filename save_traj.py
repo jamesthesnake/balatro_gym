@@ -27,7 +27,8 @@ DEFAULT_NUM_ROUNDS = 100_000
 DISCARDS_PER_ROUND = 4
 HANDS_PER_ROUND = 4
 MAX_BEAM_DISCARDS = 4
-LLM_LOCAL_PATH = os.path.expanduser("~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-R1-Distill-Llama-8B/snapshots/")
+LLM_LOCAL_PATH = "/workspace/deepseek-model"
+
 MODEL_SAVE_DIR = Path("/workspace/saved_models")  # Centralized model storage
 # --------------------------------------------------------
 
@@ -187,13 +188,20 @@ def load_llm_policy() -> Tuple[Any, Any]:
                     path = snapshots[0]
             
             # Verify required files exist
-            required_files = ["config.json", "model.safetensors", "tokenizer.json"]
+            required_files = ["config.json", "tokenizer.json"]
             missing = [f for f in required_files if not (path / f).exists()]
-            
-            if missing:
+            weights_exist = any((path / f).exists() for f in [
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json"
+            ])
+            if missing or not weights_exist:
                 print(f"⚠️ Missing files in {path}: {', '.join(missing)}")
-                continue
-                
+                if not weights_exist:
+                    print(f"⚠️ No valid model weight shards found in {path}")
+                    continue
+ 
             print(f"✅ Found complete model in {path}")
             print("⏳ Loading model...")
             
@@ -214,12 +222,6 @@ def load_llm_policy() -> Tuple[Any, Any]:
             # Save copy to standard location
             if not path.samefile(MODEL_SAVE_DIR):
                 print("💾 Creating backup in model storage...")
-                ModelSaver.save_model(
-                    mdl,
-                    tok,
-                    "deepseek-llm",
-                    {"source_path": str(path)}
-                )
             
             return tok, mdl
             
