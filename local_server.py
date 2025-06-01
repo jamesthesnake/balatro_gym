@@ -1411,7 +1411,7 @@ ONE WORD:"""
         out = model_manager.model.generate(
             **inputs,
             max_new_tokens=5,  # Just one word
-            temperature=0.1,   # Very deterministic
+            temperature=0.3,   # Slightly higher for more variation
             do_sample=True,
             pad_token_id=model_manager.tokenizer.eos_token_id,
         )
