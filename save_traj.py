@@ -1,226 +1,429 @@
+#!/usr/bin/env python3
+# save_traj.py – Enhanced version with robust model saving and trajectory collection
+
+from __future__ import annotations
 import numpy as np
 import pickle
+import argparse
+import sys
+import time
+import os
+import torch
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict, Any
+from pathlib import Path
 
-# Ensure our patch is applied before we import EightCardDrawEnv
-import balatro_gym.patch_balatro_env  # applies the BalatroGame scoring patch
-
+# Local imports
+import balatro_gym.patch_balatro_env
 from balatro_gym.env import EightCardDrawEnv
 from balatro_gym.actions import decode_discard, decode_select
 from balatro_gym.score_with_balatro import int_to_card
-from balatro_gym.balatro_game import Card, BalatroGame
+from balatro_gym.balatro_game import BalatroGame
+from heuristic_baseline import THRESHOLD_RANK, make_discard_action, make_select_action
 
-# Import the heuristic functions you defined in heuristic_baseline.py
-from heuristic_baseline import (
-    THRESHOLD_RANK,
-    make_discard_action,
-    make_select_action,
-)
+# ------------------------------------------------ CONFIG
+PASS_THRESHOLD = 300
+DEFAULT_NUM_ROUNDS = 100_000
+DISCARDS_PER_ROUND = 4
+HANDS_PER_ROUND = 4
+MAX_BEAM_DISCARDS = 4
+LLM_LOCAL_PATH = os.path.expanduser("~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-R1-Distill-Llama-8B/snapshots/")
+MODEL_SAVE_DIR = Path("/workspace/saved_models")  # Centralized model storage
+# --------------------------------------------------------
 
-# ──────────────────────────────────────────────────────────────────────── #
-# CONFIGURATION
-# ──────────────────────────────────────────────────────────────────────── #
-NUM_ROUNDS = 500             # how many rounds (each round = up to 4 hands) to collect
-HANDS_PER_ROUND = 4              # define a round as exactly 4 hands
-DISCARDS_PER_ROUND = 4           # total discard budget across HANDS_PER_ROUND hands
-PASS_THRESHOLD = 300             # raw‐chip score threshold for pass/fail at the end of a round
+BUCKET_NAMES = {
+    0: "random",
+    1: "heuristic",
+    2: "beam_search",
+    3: "llm_policy",
+    4: "human"
+}
 
-# By default, every 10th round uses the heuristic policy; others use random:
-HEURISTIC_EVERY_N_ROUNDS = 10
+class ModelSaver:
+    """Handles model saving with version control and metadata"""
+    
+    @staticmethod
+    def save_model(
+        model: torch.nn.Module,
+        tokenizer: Any = None,
+        model_name: str = "model",
+        metadata: Dict[str, Any] = None,
+        max_versions: int = 5
+    ) -> Path:
+        """
+        Save model with version control
+        
+        Args:
+            model: PyTorch/HF model to save
+            tokenizer: Corresponding tokenizer
+            model_name: Base name for model
+            metadata: Additional training info
+            max_versions: Maximum versions to keep
+            
+        Returns:
+            Path to saved model directory
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = MODEL_SAVE_DIR / f"{model_name}_v{timestamp}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # Save model
+            if hasattr(model, "save_pretrained"):  # HF models
+                model.save_pretrained(
+                    save_dir,
+                    safe_serialization=True,
+                    max_shard_size="2GB"
+                )
+            else:  # Custom PyTorch models
+                torch.save(model.state_dict(), save_dir / "pytorch_model.bin")
+            
+            # Save tokenizer if provided
+            if tokenizer and hasattr(tokenizer, "save_pretrained"):
+                tokenizer.save_pretrained(save_dir)
+            
+            # Save metadata
+            meta = {
+                "save_time": timestamp,
+                "torch_version": torch.__version__,
+                "git_hash": ModelSaver._get_git_hash(),
+                **(metadata or {})
+            }
+            torch.save(meta, save_dir / "metadata.bin")
+            
+        except Exception as e:
+            print(f"⚠️ Error saving model: {e}")
+            raise
+        
+        # Clean old versions
+        ModelSaver._clean_old_versions(model_name, max_versions)
+        
+        return save_dir
+    
+    @staticmethod
+    def _get_git_hash() -> Optional[str]:
+        """Get current git commit hash if available"""
+        try:
+            return os.popen("git rev-parse HEAD").read().strip() or None
+        except:
+            return None
+    
+    @staticmethod
+    def _clean_old_versions(model_name: str, max_keep: int):
+        """Remove excess model versions"""
+        versions = sorted(
+            [d for d in MODEL_SAVE_DIR.glob(f"{model_name}_v*") if d.is_dir()],
+            key=os.path.getmtime
+        )
+        while len(versions) > max_keep:
+            oldest = versions.pop(0)
+            os.system(f"rm -rf {oldest}")
 
-
-# ──────────────────────────────────────────────────────────────────────── #
-# HELPER FUNCTION FOR RAW‐CHIP COMPUTATION
-# ──────────────────────────────────────────────────────────────────────── #
 def compute_raw_chip_value(card_ids: np.ndarray) -> int:
-    """
-    Given a length‐5 array of card IDs (0..51), convert each to a Card object
-    and call BalatroGame._evaluate_hand(...) to get the raw chip integer.
-    """
+    """Calculate raw chip value for given card indices"""
     cards = [int_to_card(int(idx)) for idx in card_ids]
     return BalatroGame._evaluate_hand(cards)
 
+def random_discard(mask, remain):
+    """Randomly select a valid discard action"""
+    valid = [a for a in np.flatnonzero(mask) if len(decode_discard(a)) <= remain]
+    if not valid:
+        valid = [a for a in np.flatnonzero(mask) if len(decode_discard(a)) == 0]
+    action = int(np.random.choice(valid))
+    return action, len(decode_discard(action))
 
-# ──────────────────────────────────────────────────────────────────────── #
-# RANDOM‐POLICY FUNCTIONS
-# ──────────────────────────────────────────────────────────────────────── #
-def random_policy_discard(obs_mask: np.ndarray, remaining_discards: int) -> Tuple[int, int]:
-    """
-    Given the current Phase 0 `obs_mask` (shape (312,)) and how many
-    discards remain, pick a truly random legal discard action that
-    does not exceed `remaining_discards`. Returns (action, num_discarded).
-    """
-    valid_actions = np.flatnonzero(obs_mask == 1)
-    filtered = []
-    for a in valid_actions:
-        discard_indices = decode_discard(int(a))
-        if len(discard_indices) <= remaining_discards:
-            filtered.append(a)
+def random_select(mask):
+    """Randomly select a valid action"""
+    return int(np.random.choice(np.flatnonzero(mask)))
 
-    # If nothing fits the budget, force pick “discard 0 cards”
-    if not filtered:
-        for a in valid_actions:
-            if len(decode_discard(int(a))) == 0:
-                filtered = [a]
-                break
+def heuristic_discard(hand, remain):
+    """Heuristic-based discard selection"""
+    a = make_discard_action(hand, THRESHOLD_RANK)
+    return (a, len(decode_discard(a))) if len(decode_discard(a)) <= remain else (0, 0)
 
-    choice = int(np.random.choice(filtered))
-    num_discarded = len(decode_discard(choice))
-    return choice, num_discarded
+def heuristic_select(hand):
+    """Heuristic-based card selection"""
+    return make_select_action(hand)
 
+def beam_best_discard(hand: np.ndarray,
+                     mask: np.ndarray,
+                     remain_disc: int) -> Tuple[int, int]:
+    """Beam search for best discard action"""
+    best_a, best_score = 0, -1
+    for a in np.flatnonzero(mask):
+        disc = decode_discard(int(a))
+        if len(disc) > remain_disc:
+            continue
+        keep_idx = tuple(sorted(set(range(8)) - set(disc)))
+        if len(keep_idx) != 5:
+            continue
+        raw = compute_raw_chip_value(hand[list(keep_idx)])
+        if raw > best_score:
+            best_score, best_a = raw, int(a)
+    return best_a, len(decode_discard(best_a))
 
-def random_policy_select(obs_mask: np.ndarray) -> int:
-    """
-    Given the current Phase 1 `obs_mask` (shape (312,)), pick a random
-    valid select action [256..311] uniformly.
-    """
-    valid_actions = np.flatnonzero(obs_mask == 1)
-    return int(np.random.choice(valid_actions))
+def load_llm_policy() -> Tuple[Any, Any]:
+    """Enhanced model loader with automatic saving"""
+    possible_paths = [
+        Path(LLM_LOCAL_PATH),
+        Path("~/deepseek-model").expanduser(),
+        Path("/usr/local/share/deepseek-model"),
+        Path(__file__).parent / "deepseek-model"
+    ]
+    
+    for path in possible_paths:
+        try:
+            if not path.exists():
+                continue
+                
+            print(f"🔍 Checking for model in {path}...")
+            
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            
+            # Handle HuggingFace cache structure
+            if "snapshots" in str(path):
+                snapshots = [d for d in path.iterdir() if d.is_dir()]
+                if snapshots:
+                    path = snapshots[0]
+            
+            # Verify required files exist
+            required_files = ["config.json", "model.safetensors", "tokenizer.json"]
+            missing = [f for f in required_files if not (path / f).exists()]
+            
+            if missing:
+                print(f"⚠️ Missing files in {path}: {', '.join(missing)}")
+                continue
+                
+            print(f"✅ Found complete model in {path}")
+            print("⏳ Loading model...")
+            
+            tok = AutoTokenizer.from_pretrained(
+                path,
+                local_files_only=True,
+                trust_remote_code=True
+            )
+            mdl = AutoModelForCausalLM.from_pretrained(
+                path,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+                trust_remote_code=True
+            )
+            mdl.eval()
+            
+            # Save copy to standard location
+            if not path.samefile(MODEL_SAVE_DIR):
+                print("💾 Creating backup in model storage...")
+                ModelSaver.save_model(
+                    mdl,
+                    tok,
+                    "deepseek-llm",
+                    {"source_path": str(path)}
+                )
+            
+            return tok, mdl
+            
+        except Exception as e:
+            print(f"⚠️ Error loading from {path}: {str(e)}")
+            continue
+    
+    print("\n❌ Could not load model from any standard location")
+    return None, None
 
+tok_llm, mdl_llm = load_llm_policy()
 
-# ──────────────────────────────────────────────────────────────────────── #
-# MAIN TRAJECTORY‐COLLECTION FUNCTION
-# ──────────────────────────────────────────────────────────────────────── #
-def collect_trajectories(num_rounds: int,
-                         hands_per_round: int,
-                         discard_budget: int) -> List[List[List[dict]]]:
-    """
-    Run `num_rounds` rounds, each consisting of `hands_per_round` independent hands.
-    Some rounds (every HEURISTIC_EVERY_N_ROUNDS‐th) will use the heuristic policy
-    (from heuristic_baseline.py), otherwise default to random‐policy. Each hand has:
-      - Phase 0: discard (budgeted by remaining_discards)
-      - Phase 1: select‐five (no discard cost)
+def llm_policy(env, mask):
+    """LLM-based card selection policy"""
+    if not tok_llm or not mdl_llm:
+        return heuristic_select(env.hand)
+    
+    prompt = (
+        "Balatro Hand Advice:\n"
+        f"Hand: {' '.join(env.card_to_str(c) for c in env.hand)}\n"
+        "Choose exactly 5 cards to keep. Format:\n"
+        "KEEP [card1] [card2] [card3] [card4] [card5]\n"
+        "Response: "
+    )
+    
+    try:
+        inputs = tok_llm(prompt, return_tensors="pt").to(mdl_llm.device)
+        outputs = mdl_llm.generate(
+            **inputs,
+            max_new_tokens=15,
+            temperature=0.3,
+            do_sample=True,
+            pad_token_id=tok_llm.eos_token_id
+        )
+        response = tok_llm.decode(outputs[0], skip_special_tokens=True)
+        
+        if "KEEP" in response:
+            card_strs = [s for s in response.split("KEEP")[1].strip().split() if len(s) == 2][:5]
+            if len(card_strs) == 5:
+                idxs = []
+                for card_str in card_strs:
+                    try:
+                        idxs.append(env.hand.index(env.str_to_card(card_str)))
+                    except ValueError:
+                        continue
+                
+                if len(idxs) == 5:
+                    for a in range(256, 312):
+                        if sorted(decode_select(a)) == sorted(idxs):
+                            if mask[a]:
+                                return a
+    except Exception as e:
+        print(f"⚠️ LLM error: {e}")
+    
+    return heuristic_select(env.hand)
 
-    We re‐instantiate a fresh EightCardDrawEnv() at the start of each hand so that
-    the deck is reset. We also enforce that across the entire round you may discard
-    at most `discard_budget` cards total.
+def play_round(bucket_id: int) -> List[List[dict]]:
+    """Play one complete round (4 hands)"""
+    round_data = []
+    round_score = 0
+    discards_left = DISCARDS_PER_ROUND
 
-    Returns:
-        A nested list of shape [num_rounds][hands_per_round][2]:
-          Each innermost element is a transition dict with keys:
-            "hand_before":         np.ndarray(8,)   (card IDs 0..51)
-            "phase":               int (0 or 1)
-            "action":              int (0..311)
-            "reward":              float (normalized [0,1])
-            "hand_after":          np.ndarray(8,) or None
-            "keep_indices":        tuple of int (length=5) or None
-            "balatro_raw_score":   int or None (only in Phase 1)
-            "num_discards":        int (cards discarded in Phase 0) or 0
-            "done":                bool
-            "round_score_so_far":  int (only in Phase 1)
-            "round_pass":          bool (only on final hand’s Phase 1)
-    """
-    all_rounds: List[List[List[dict]]] = []
-
-    for rnd in range(num_rounds):
-        # Decide policy for this round:
-        use_heuristic = (rnd % HEURISTIC_EVERY_N_ROUNDS == 0)
-
-        remaining_discards = discard_budget
-        round_raw_score = 0
-        round_trajectories: List[List[dict]] = []
-
-        for hand_idx in range(hands_per_round):
-            # Re‐instantiate a fresh env for each hand (deck reset)
-            env = EightCardDrawEnv()
-            obs, _ = env.reset()
-            hand_transitions: List[dict] = []
-            done = False
-
-            while not done:
-                phase = int(obs["phase"])
-                mask = obs["action_mask"]  # shape (312,)
-
-                if phase == 0:
-                    # ── Phase 0: Discard step ──
-                    if use_heuristic:
-                        # Use the heuristic_baseline’s discard action function:
-                        discard_action = make_discard_action(env.hand, THRESHOLD_RANK)
-                        discard_positions = decode_discard(discard_action)
-                        if len(discard_positions) > remaining_discards:
-                            # Fallback to “discard 0 cards”
-                            discard_action = 0
-                            num_discarded = 0
-                        else:
-                            num_discarded = len(discard_positions)
-                        action = discard_action
-                    else:
-                        # Random policy: pick a random legal discard ≤ remaining_discards
-                        action, num_discarded = random_policy_discard(mask, remaining_discards)
-
-                    remaining_discards -= num_discarded
-
+    for _ in range(HANDS_PER_ROUND):
+        env = EightCardDrawEnv()
+        obs, _ = env.reset()
+        hand_data = []
+        done = False
+        
+        while not done:
+            phase = obs["phase"]
+            mask = obs["action_mask"]
+            
+            if phase == 0:  # Discard phase
+                if bucket_id == 0:
+                    action, n_disc = random_discard(mask, discards_left)
+                elif bucket_id == 1:
+                    action, n_disc = heuristic_discard(env.hand, discards_left)
+                elif bucket_id == 2:
+                    action, n_disc = beam_best_discard(env.hand, mask, discards_left)
                 else:
-                    # ── Phase 1: Select‐five step ──
-                    if use_heuristic:
-                        # Use the heuristic_baseline’s select action function:
-                        action = make_select_action(env.hand)
-                    else:
-                        action = random_policy_select(mask)
-                    num_discarded = 0
+                    action, n_disc = random_discard(mask, discards_left)
+                discards_left -= n_disc
+            else:  # Select phase
+                if bucket_id == 0:
+                    action = random_select(mask)
+                elif bucket_id == 1:
+                    action = heuristic_select(env.hand)
+                elif bucket_id == 2:
+                    action = max(np.flatnonzero(mask))
+                elif bucket_id == 3:
+                    action = llm_policy(env, mask)
+                    if not mask[action]:
+                        action = heuristic_select(env.hand)
+                else:
+                    action = random_select(mask)
+                n_disc = 0
 
-                # ── Step the environment ─────────────────────────────────────────────
-                hand_before = env.hand.copy()  # np.ndarray(8,)
-                next_obs, reward, done, truncated, info = env.step(action)
-                hand_after = env.hand.copy() if (phase == 0) else None
+            # Record pre-action state
+            step_data = {
+                "bucket": bucket_id,
+                "hand_before": env.hand.copy(),
+                "phase": phase,
+                "action": int(action),
+                "reward": 0.0,
+                "done": False
+            }
 
-                keep_indices = None
-                balatro_raw_score = None
-                if phase == 1:
-                    keep_indices = decode_select(action)
-                    kept_ids = env.hand[list(keep_indices)]
-                    balatro_raw_score = compute_raw_chip_value(kept_ids)
-                    round_raw_score += balatro_raw_score
+            # Execute action
+            obs, reward, done, _, _ = env.step(action)
+            
+            # Record post-action state
+            step_data.update({
+                "reward": float(reward),
+                "hand_after": env.hand.copy() if phase == 0 else None,
+                "done": done
+            })
 
-                transition = {
-                    "hand_before":       hand_before,        # np.ndarray(8,)
-                    "phase":             phase,              # 0 or 1
-                    "action":            action,             # int 0..311
-                    "reward":            reward,             # float normalized [0,1]
-                    "hand_after":        hand_after,         # np.ndarray(8,) or None
-                    "keep_indices":      keep_indices,       # tuple length=5 or None
-                    "balatro_raw_score": balatro_raw_score,  # int or None
-                    "num_discards":      num_discarded,      # how many cards dropped
-                    "done":              done                # bool
-                }
+            if phase == 1:  # Selection-specific data
+                kept = decode_select(action)
+                raw_score = compute_raw_chip_value(env.hand[list(kept)])
+                round_score += raw_score
+                step_data.update({
+                    "keep_indices": kept,
+                    "balatro_raw_score": raw_score,
+                    "num_discards": n_disc
+                })
+                
+            hand_data.append(step_data)
 
-                hand_transitions.append(transition)
-                obs = next_obs
+        # Mark final hand of the round
+        if len(round_data) == HANDS_PER_ROUND - 1:
+            hand_data[1]["round_pass"] = round_score > PASS_THRESHOLD
+        hand_data[1]["round_score_so_far"] = round_score
+        round_data.append(hand_data)
 
-            # ── End of one hand (Phases 0 & 1) ──
-            # Annotate the Phase 1 transition with running total and pass/fail
-            phase1_transition = hand_transitions[1]
-            phase1_transition["round_score_so_far"] = round_raw_score
-            if hand_idx == hands_per_round - 1:
-                phase1_transition["round_pass"] = (round_raw_score > PASS_THRESHOLD)
+    return round_data
 
-            round_trajectories.append(hand_transitions)
+def collect_bucket(bucket_id: int, num_rounds: int) -> List[List[List[dict]]]:
+    """Collect trajectories for a specific bucket"""
+    bucket_name = BUCKET_NAMES.get(bucket_id, f"bucket_{bucket_id}")
+    print(f"\nStarting {bucket_name} collection ({num_rounds} rounds)...")
+    
+    trajectories = []
+    start_time = time.time()
+    
+    for i in range(num_rounds):
+        trajectories.append(play_round(bucket_id))
+        
+        if (i + 1) % max(1, num_rounds // 10) == 0:
+            elapsed = time.time() - start_time
+            print(f"  Completed {i + 1}/{num_rounds} rounds ({elapsed:.1f}s)")
+    
+    return trajectories
 
-        # ── End of this round (HANDS_PER_ROUND hands) ──
-        all_rounds.append(round_trajectories)
-
-        # (Optional) Progress output
-        if (rnd + 1) % 50_000 == 0:
-            print(f"Collected {rnd + 1}/{num_rounds} rounds...")
-
-    return all_rounds
-
-
-# ──────────────────────────────────────────────────────────────────────── #
-# MAIN & SAVE
-# ──────────────────────────────────────────────────────────────────────── #
-def main():
-    trajectories = collect_trajectories(NUM_ROUNDS, HANDS_PER_ROUND, DISCARDS_PER_ROUND)
-    print(f"Collected {len(trajectories)} rounds; each round has {HANDS_PER_ROUND} hands.")
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"pickles/rounds_{timestamp}.pkl"
-
+def save_bucket(bucket_id: int, data: List, timestamp: str):
+    """Save bucket data to pickle file"""
+    os.makedirs("pickles", exist_ok=True)
+    bucket_name = BUCKET_NAMES.get(bucket_id, f"bucket_{bucket_id}")
+    filename = f"pickles/{bucket_name}_{timestamp}.pkl"
+    
     with open(filename, "wb") as f:
-        pickle.dump(trajectories, f)
-    print(f"Saved rounds to {filename}")
+        pickle.dump(data, f)
+    
+    print(f"Saved {len(data)} rounds to {filename}")
+    return filename
 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--buckets", default="0,1,2,3",
+                       help="Comma-separated bucket IDs (0-4)")
+    parser.add_argument("--rounds", type=int, default=DEFAULT_NUM_ROUNDS,
+                       help="Number of rounds per bucket")
+    parser.add_argument("--save-model", action="store_true",
+                       help="Force save model after completion")
+    args = parser.parse_args()
+
+    # Initialize model storage
+    MODEL_SAVE_DIR.mkdir(exist_ok=True)
+    
+    # Load policy (will auto-save if found)
+    global tok_llm, mdl_llm
+    tok_llm, mdl_llm = load_llm_policy()
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bucket_ids = [int(b) for b in args.buckets.split(",")]
+    
+    print(f"\nBalatro Trajectory Collection")
+    print(f"Buckets: {[BUCKET_NAMES.get(b, '?') for b in bucket_ids]}")
+    print(f"Rounds per bucket: {args.rounds}")
+    print(f"Model storage: {MODEL_SAVE_DIR}")
+    
+    for bucket_id in bucket_ids:
+        data = collect_bucket(bucket_id, args.rounds)
+        save_bucket(bucket_id, data, timestamp)
+    
+    # Optionally save final model
+    if args.save_model and mdl_llm:
+        save_path = ModelSaver.save_model(
+            mdl_llm,
+            tok_llm,
+            "final_policy",
+            {"training_rounds": args.rounds}
+        )
+        print(f"✅ Final model saved to {save_path}")
 
 if __name__ == "__main__":
     main()
