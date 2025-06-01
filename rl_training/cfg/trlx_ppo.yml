@@ -1,0 +1,26 @@
+model:
+  model_path: checkpoints/latest     # ← path produced by SFT
+  load_in_4bit: true
+  lora_rank: 64
+
+tokenizer:
+  tokenizer_path: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  add_special_tokens: ["<SEP>", "<EOS>"]
+
+method:
+  name: PPO
+  kl_coef: 0.05
+  ppo_epochs: 4
+  target: 6       # TRLX default – leave as-is
+
+train:
+  total_steps: 8000
+  batch_size: 128
+  seq_length: 256
+  gradient_accumulation_steps: 8
+  checkpoint_interval: 1000
+  seed: 1234
+
+deepspeed:
+  zero_optimization:
+    stage: 2
