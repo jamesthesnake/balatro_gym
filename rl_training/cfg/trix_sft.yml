@@ -1,0 +1,22 @@
+model:
+  model_path: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  load_in_4bit: true
+  lora_rank: 64
+
+tokenizer:
+  tokenizer_path: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  add_special_tokens: ["<SEP>", "<EOS>"]         # <ROUND=…> etc. auto-added
+
+train:
+  epochs: 2
+  batch_size: 512               # global
+  seq_length: 256
+  gradient_accumulation_steps: 16
+  lr: 2e-4
+  optimizer: adamw_bnb_8bit
+  seed: 42
+  checkpoint_interval: 1000
+
+deepspeed:
+  zero_optimization:
+    stage: 2
