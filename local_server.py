@@ -274,7 +274,7 @@ class ModelManager:
     def load_model(self):
         if not self.model_loaded:
             logger.info("Starting model load...")
-            MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+            MODEL_NAME = "rl/rl-DeepSeek-R1-Distill-Llama-8B"
             
             import os
             possible_paths = [
@@ -1334,7 +1334,6 @@ async def make_one_word_decision(request: AgentDecision):
     if request.session_id in sessions:
         session = sessions[request.session_id]
         session.game_state = request.game_state
-        logger.info("Updating existing session")
     else:
         session = SessionState(
             session_id=request.session_id,
@@ -1346,7 +1345,6 @@ async def make_one_word_decision(request: AgentDecision):
             last_updated=datetime.now()
         )
         sessions[request.session_id] = session
-        logger.info("Created new session")
     
     # Process decision
     try:
@@ -1354,7 +1352,6 @@ async def make_one_word_decision(request: AgentDecision):
             process_one_word_decision(session),
             timeout=request.timeout
         )
-        logger.info(f"Decision successful: {decision.action}")
         logger.info(f"{'='*60}\n")
         return decision
     except asyncio.TimeoutError:
@@ -1419,10 +1416,25 @@ ONE WORD:"""
     response = model_manager.tokenizer.decode(
         out[0][inputs["input_ids"].shape[1]:], 
         skip_special_tokens=True
-    ).strip().lower()
+    ).strip()
     
-    # Extract first word
-    llm_word = response.split()[0] if response else "keep"
+    # Extract first word and clean it
+    response = response.replace('"', '').replace("'", '').strip()
+    if response:
+        # Get first word
+        words = response.split()
+        if words:
+            llm_word = words[0].lower()
+        else:
+            llm_word = "keep"
+    else:
+        llm_word = "keep"
+    
+    # Make sure it's either keep or discard
+    if llm_word not in ["keep", "discard"]:
+        logger.info(f"   LLM said '{response}', defaulting to 'keep'")
+        llm_word = "keep"
+    
     logger.info(f"🎯 LLM says: {llm_word.upper()}")
     
     # Execute decision
